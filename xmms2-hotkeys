@@ -1,0 +1,299 @@
+#!/usr/bin/python -O
+#
+# Copyright (c) 2011 Sebastian Noack
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation; either version 3 of the License, or (at your
+# option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+# or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+# for more details.
+#
+
+import os
+import re
+import sys
+import logging
+import ConfigParser
+
+try:
+	import gobject
+	import xmmsclient
+	import xmmsclient.glib
+	import dbus
+	import dbus.mainloop.glib
+except ImportError, e:
+	print >>sys.stderr, '%s, you need it to run %s.' % (e, os.path.basename(__file__))
+	sys.exit(1)
+
+
+CLIENT_NAME      = 'xmms2-hotkeys'
+CONFIG_FILENAME  = os.path.expanduser(os.path.join('~', '.config', 'xmms2', 'clients', CLIENT_NAME + '.conf'))
+
+ABSOLUTE = 1
+RELATIVE = 2
+
+MILLISECONDS = 'ms'
+SAMPLES      = 'samples'
+
+UP   = 1
+DOWN = 2
+
+KEY_PRESSED      = 'pressed'
+KEY_PRESSED_ONCE = 'pressed-once'
+KEY_HOLD         = 'hold'
+
+
+actions = {}
+
+class ActionImproperlyConfigured(Exception):
+	pass
+
+def camelcase_to_dashes(s):
+	return re.sub(r'[A-Z]', lambda m: (m.start() > 0 and '-' or '') + m.group(0).lower(), s)
+
+def parse_position(s):
+	try:
+		return (int(s), s[:1] in ('-', '+') and RELATIVE or ABSOLUTE)
+	except ValueError:
+		raise ActionImproperlyConfigured
+
+def get_default_hotkeys():
+	return {
+		'play':          Hotkey({KEY_PRESSED: Play()}),
+		'play-cd':       Hotkey({KEY_PRESSED: Play()}),
+		'pause-cd':      Hotkey({KEY_PRESSED: Pause()}),
+		'play-pause':    Hotkey({KEY_PRESSED: Toggle()}),
+		'stop-cd':       Hotkey({KEY_PRESSED: Stop()}),
+		'previous-song': Hotkey({KEY_PRESSED_ONCE: Jump('-1'), KEY_HOLD: Seek('-1000ms')}),
+		'next-song':     Hotkey({KEY_PRESSED_ONCE: Jump('+1'), KEY_HOLD: Seek('+1000ms')}),
+	}
+
+class ActionMetaclass(type):
+	def __new__(cls, name, bases, attrs):
+		abstract = attrs.setdefault('abstract', False)
+		new_class = type.__new__(cls, name, bases, attrs)
+
+		if not abstract:
+			identifier = camelcase_to_dashes(name)
+			if identifier in actions:
+				raise TypeError('An action with the name %r (or similar) is already registered.' % name)
+			actions[identifier] = new_class
+
+		return new_class
+
+class Action(object):
+	__metaclass__ = ActionMetaclass
+
+	abstract = True
+
+	def __new__(cls, *args, **kwargs):
+		if cls.abstract:
+			raise TypeError('You can not instantiate an abstract action.')
+
+		rv = object.__new__(cls)
+		if logging.root.level <= logging.INFO:
+			rv.debug_info = ' '.join((camelcase_to_dashes(cls.__name__),) + args)
+		return rv
+
+	def execute(self, connection):
+		raise NotImplementedError
+
+class Play(Action):
+	def execute(self, connection):
+		connection.playback_start()
+
+class Pause(Action):
+	def execute(self, connection):
+		connection.playback_pause()
+
+class Toggle(Action):
+	def execute(self, connection):
+		def cb(res):
+			if res.get_int() == xmmsclient.PLAYBACK_STATUS_PLAY:
+				connection.playback_pause()
+			else:
+				connection.playback_start()
+		connection.playback_status(cb)
+
+class Stop(Action):
+	def execute(self, connection):
+		connection.playback_stop()
+
+class Jump(Action):
+	def __init__(self, pos):
+		self.pos, self.whence = parse_position(pos)
+
+	def execute(self, connection):
+		cb = lambda res: connection.playback_tickle()
+
+		if self.whence == RELATIVE:
+			connection.playlist_set_next_rel(self.pos, cb)
+		else:
+			connection.playlist_set_next(self.pos, cb)
+
+class Seek(Action):
+	def __init__(self, pos):
+		m = re.match(r'([+-]?\d+)(ms|samples)?$', pos)
+		if not m:
+			raise ActionImproperlyConfigured
+
+		self.pos, self.whence = parse_position(m.group(1))
+		self.unit = m.group(2) or MILLISECONDS
+
+	def execute(self, connection):
+		if self.unit == SAMPLES:
+			if self.whence == RELATIVE:
+				connection.playback_seek_samples_rel(self.pos)
+			else:
+				connection.playback_seek_samples(self.pos)
+		else:
+			if self.whence == RELATIVE:
+				connection.playback_seek_ms_rel(self.pos)
+			else:
+				connection.playback_seek_ms(self.pos)
+
+class Hotkey(object):
+	def __init__(self, actions=None):
+		self.actions = actions or {}
+		self.reset()
+
+	def emit(self, condition, connection):
+		if condition in self.actions:
+			action = self.actions[condition]
+			if logging.root.level <= logging.INFO:
+				logging.info(action.debug_info)
+			action.execute(connection)
+
+	def reset(self):
+		self.state = UP
+		self.timeout_func_id = None
+
+	def press(self, connection):
+		self.emit(KEY_PRESSED, connection)
+
+		# If there is no action for KEY_PRESSED_ONCE or KEY_HOLD, we don't need
+		# to add a timeout function in order to watch the hotkey's state.
+		if KEY_PRESSED_ONCE not in self.actions and KEY_HOLD not in self.actions:
+			return
+
+		if self.timeout_func_id is not None:
+			gobject.source_remove(self.timeout_func_id)
+
+		if self.state == UP:
+			self.state = DOWN
+
+			def cb():
+				self.emit(KEY_PRESSED_ONCE, connection)
+				self.reset()
+		else:
+			self.emit(KEY_HOLD, connection)
+			cb = self.reset
+
+		self.timeout_func_id = gobject.timeout_add(300, cb)
+
+class Xmms2Hotkeys(object):
+	def __init__(self, hotkeys=None, path=None, daemon=False):
+		self.daemon = daemon
+
+		# Setup message bus and register signal.
+		logging.debug('connecting to system bus (D-Bus)')
+		bus = dbus.SystemBus(mainloop=dbus.mainloop.glib.DBusGMainLoop())
+		bus.add_signal_receiver(self.cb_dbus_hal_event, dbus_interface='org.freedesktop.Hal.Device')
+
+		# Create an asynchronous connection to xmms2d and register disconnect callback.
+		logging.debug('connecting to ' + (path and 'xmms2d at %s' % path or 'local xmms2d'))
+		self.connection = xmmsclient.XMMS(CLIENT_NAME)
+		self.connection.connect(path, self.cb_xmms2_disconnect)
+
+		# Create the glib event loop and connect it to the xmms2 connection.
+		self.loop = gobject.MainLoop()
+		xmmsclient.glib.GLibConnector(self.connection)
+
+		# Load default or use the given hotkeys, if any.
+		if hotkeys is None:
+			logging.debug('using default hotkey configuration')
+			self.hotkeys = get_default_hotkeys()
+		else:
+			logging.debug('using custom hotkey configuration')
+			self.hotkeys = hotkeys
+
+		# Log the key mapping for the hotkeys if log level is DEBUG.
+		if logging.root.level > logging.DEBUG:
+			return
+		for key, hotkey in self.hotkeys.iteritems():
+			for condition, action in hotkey.actions.iteritems():
+				logging.debug('%s%s = %s' % (key.rjust(15), ('[%s]' % condition).ljust(15), action.debug_info))
+
+	def run(self):
+		if self.daemon:
+			pid = os.fork()
+			if pid:
+				logging.debug('child process [%d] forked' % pid)
+				return
+
+		self.loop.run()
+
+	def cb_dbus_hal_event(self, event, payload):
+		if event == 'ButtonPressed':
+			logging.debug("HAL emits ButtonPressed event with payload '%s'" % payload)
+			if payload in self.hotkeys:
+				self.hotkeys[payload].press(self.connection)
+
+	def cb_xmms2_disconnect(self, client):
+		logging.debug('xmms2 has disconnected')
+		self.loop.quit()
+
+if __name__ == '__main__':
+	parser = ConfigParser.SafeConfigParser()
+	parser.read(CONFIG_FILENAME)
+
+	try:
+		level = logging.getLevelName(parser.get('client', 'log-level').upper())
+		if not isinstance(level, int):
+			print >>sys.stderr, "Invalid value for option 'log-level' in section 'client' in the configuration file."
+			sys.exit(1)
+	except ConfigParser.Error:
+		level = None
+
+	logging.basicConfig(level=level, format='%(levelname)s:%(message)s')
+
+	try:
+		daemon = parser.getboolean('client', 'daemon')
+	except ConfigParser.Error:
+		daemon = True
+	except ValueError:
+		print >>sys.stderr, "Invalid value for option 'daemon' in section 'client' in the configuration file."
+		sys.exit(1)
+
+	try:
+		hotkeys = {}
+
+		for key, action_definition in parser.items('hotkeys'):
+			action_args = action_definition.split()
+			action_name = action_args.pop(0)
+
+			try:
+				action = actions[action_name](*action_args)
+			except KeyError:
+				print >>sys.stderr, "Unknown action '%s' given in configuration file." % action_name
+				sys.exit(1)
+			except ActionImproperlyConfigured:
+				print >>sys.stderr, "Wrong usage of action '%s' in configuration file." % action_name
+				sys.exit(1)
+
+			key, condition = re.match(r'(.*?)(?:\[(.*)\])?$', key).groups()
+
+			try:
+				hotkey = hotkeys[key]
+			except KeyError:
+				hotkey = hotkeys[key] = Hotkey()
+
+			hotkey.actions[condition or KEY_PRESSED] = action
+	except ConfigParser.NoSectionError:
+		hotkeys = None
+
+	Xmms2Hotkeys(hotkeys, os.getenv('XMMS_PATH'), daemon).run()
