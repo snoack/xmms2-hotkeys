@@ -156,6 +156,10 @@ class Seek(Action):
 			else:
 				connection.playback_seek_ms(self.pos)
 
+class Clear(Action):
+	def execute(self, connection):
+		connection.playlist_clear()
+
 class Hotkey(object):
 	def __init__(self, actions=None):
 		self.actions = actions or {}
